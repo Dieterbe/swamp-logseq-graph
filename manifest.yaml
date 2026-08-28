@@ -6,7 +6,7 @@ repository: "https://github.com/Dieterbe/swamp-logseq-graph"
 paths:
   base: manifest
 models:
-  - logseq_graph.ts
+  - extensions/models/logseq-graph/logseq_graph.ts
 additionalFiles:
   - README.md
   - LICENSE
