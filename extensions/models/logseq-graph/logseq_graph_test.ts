@@ -36,7 +36,8 @@ Deno.test("scan emits page, block, and summary resources", async () => {
       },
     });
 
-    assert(result.dataHandles.length === 5, "expected two pages, two blocks, and one summary");
+    assert(result.dataHandles.length === 1, "scan should return only the compact summary handle");
+    assert(writes.length === 5, "expected two pages, two blocks, and one summary write");
     assert(writes.filter((write) => write.specName === "page").length === 2, "expected two page resources");
     assert(writes.filter((write) => write.specName === "block").length === 2, "expected two block resources");
     const summary = writes.find((write) => write.specName === "summary")?.data as Record<string, unknown>;
@@ -63,5 +64,24 @@ Deno.test("scan fails before writing when no Markdown pages exist", async () => 
     }
     assert(message.includes("No Markdown pages found"), "expected actionable empty-graph error");
     assert(writes === 0, "failure must occur before resource writes");
+  });
+});
+
+Deno.test("scheduled selects exact dates and earlier dates", async () => {
+  await withTempGraph({
+    "pages/Tasks.md": "- Past\n  scheduled:: 2020-01-02\n- Future\n  scheduled:: 2999-12-31\n",
+  }, async (graphPath) => {
+    const writes: Array<{ specName: string; data: object }> = [];
+    await model.methods.scheduled.execute({ date: "2020-01-02", before: false }, {
+      globalArgs: { graphPath },
+      logger: { info: () => undefined },
+      writeResource: (specName, name, data) => {
+        writes.push({ specName, data });
+        return Promise.resolve({ name });
+      },
+    });
+    assert(writes.filter((write) => write.specName === "scheduled").length === 1, "exact date should emit one scheduled result");
+    const result = writes.find((write) => write.specName === "scheduled")?.data as Record<string, unknown>;
+    assert(result.matchCount === 1, "exact date should match one block");
   });
 });

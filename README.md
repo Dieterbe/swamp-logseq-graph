@@ -1,8 +1,8 @@
 # @dieter/logseq-graph
 
-Read a local [Logseq](https://logseq.com/) Markdown graph into typed Swamp resources.
+Read a local [Logseq](https://logseq.com/) Markdown graph into typed [Swamp](https://swamp-club.com) resources.
 
-The first release is read-only because silently rewriting Markdown risks losing formatting or conflicting with Logseq. A generic Markdown corpus model was considered, but it does not represent Logseq blocks, page references, block references, properties, tags, or namespaces.
+The first release offers only a few read-only methods.  More features coming.
 
 ## Use
 
@@ -16,12 +16,33 @@ swamp data list my-graph
 
 `scan` reads Markdown files directly inside `pages/` and `journals/`. It emits one `page` resource per file, one `block` resource per bullet, and a `summary` resource. Query these resources with `swamp data query`.
 
-Every emitted resource includes the scan timestamp. Filter page and block queries to the timestamp in `summary.scannedAt`; this excludes older resources left behind when a page or block was deleted between scans. Keeping historical resources is intentional because Swamp data is versioned, while destructive cleanup would discard audit history.
+## Scheduled items
 
-For example, find blocks that link to a particular page:
+Use `scheduled` when you only need dated items; it reads the graph and returns a single aggregate resource without rebuilding the full page/block index:
 
 ```sh
-swamp data query my-graph '"Roadmap" in attributes.links'
+# Items scheduled for an exact date
+swamp model method run my-graph scheduled --input date=2026-08-28
+
+# Items scheduled before that date (overdue)
+swamp model method run my-graph scheduled \
+  --input date=2026-08-28 --input before=true
+```
+
+Results are stored under parameter-specific names, such as `scheduled-2026-08-28-exact` and `scheduled-2026-08-28-before`. Inspect one with:
+
+```sh
+swamp data get my-graph scheduled-2026-08-28-before
+```
+
+Omit `date` to return every block that has a scheduled date. The `before` selector is strict: it includes dates earlier than the selected date, not the selected date itself.
+
+Every emitted resource includes the scan timestamp. Filter page and block queries to the timestamp in `summary.scannedAt`; this excludes older resources left behind when a page or block was deleted between scans. Keeping historical resources is intentional because Swamp data is versioned, while destructive cleanup would discard audit history.
+
+For example, list artifact names in the full index:
+
+```sh
+swamp data query 'modelName == "my-graph"' --select 'data.name'
 ```
 
 No graph content is sent over the network. The model does not modify graph files.

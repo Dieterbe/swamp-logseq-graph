@@ -6,11 +6,18 @@
 import { z } from "npm:zod@4";
 import { parseLogseqFile } from "./logseq_parser.ts";
 
-const VERSION = "2026.08.28.3";
+const VERSION = "2026.08.28.4";
 const GlobalArgsSchema = z.object({
   graphPath: z.string().min(1).describe("Absolute path to the Logseq graph"),
 });
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
+const ScheduledArgsSchema = z.object({
+  date: z.iso.date().optional().describe("Exact scheduled date or upper bound"),
+  before: z.boolean().default(false).describe(
+    "Include dates before the selected date",
+  ),
+});
+type ScheduledArgs = z.infer<typeof ScheduledArgsSchema>;
 
 const CommonReferencesSchema = z.object({
   scannedAt: z.iso.datetime(),
@@ -24,6 +31,7 @@ const PageSchema = z.object({
   namespace: z.array(z.string()),
   properties: z.record(z.string(), z.string()),
   blockCount: z.number().int().nonnegative(),
+  overdueCount: z.number().int().nonnegative(),
 }).extend(CommonReferencesSchema.shape);
 const BlockSchema = z.object({
   id: z.string(),
@@ -33,12 +41,30 @@ const BlockSchema = z.object({
   depth: z.number().int().nonnegative(),
   content: z.string(),
   properties: z.record(z.string(), z.string()),
+  scheduledDate: z.string().nullable(),
+  deadlineDate: z.string().nullable(),
+  overdue: z.boolean(),
 }).extend(CommonReferencesSchema.shape);
 const SummarySchema = z.object({
   graphPath: z.string(),
   scannedAt: z.iso.datetime(),
   pageCount: z.number().int().nonnegative(),
   blockCount: z.number().int().nonnegative(),
+});
+const ScheduledSummarySchema = z.object({
+  graphPath: z.string(),
+  scannedAt: z.iso.datetime(),
+  date: z.string().nullable(),
+  before: z.boolean(),
+  matchCount: z.number().int().nonnegative(),
+});
+const ScheduledSchema = z.object({
+  graphPath: z.string(),
+  scannedAt: z.iso.datetime(),
+  date: z.string().nullable(),
+  before: z.boolean(),
+  matchCount: z.number().int().nonnegative(),
+  items: z.array(BlockSchema),
 });
 
 type DataHandle = { name: string };
@@ -107,6 +133,18 @@ export const model = {
     summary: {
       description: "Counts and timestamp for a completed graph scan",
       schema: SummarySchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    scheduledSummary: {
+      description: "Counts for a scheduled-block query",
+      schema: ScheduledSummarySchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    scheduled: {
+      description: "Blocks matching a scheduled-date query",
+      schema: ScheduledSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -186,6 +224,55 @@ export const model = {
         // Writes are persisted individually; return only the compact summary
         // to keep large-graph reports bounded.
         return { dataHandles: [summaryHandle] };
+      },
+    },
+    scheduled: {
+      description:
+        "Find blocks with scheduled dates, optionally selecting one date or dates before it.",
+      arguments: ScheduledArgsSchema,
+      execute: async (
+        args: ScheduledArgs,
+        context: Context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        const files = await markdownFiles(graphPath);
+        const parsed = [];
+        for (const path of files) {
+          parsed.push(
+            parseLogseqFile(
+              path,
+              await Deno.readTextFile(`${graphPath}/${path}`),
+            ),
+          );
+        }
+        if (args.before && !args.date) {
+          throw new Error(
+            "scheduled --before requires --input date=YYYY-MM-DD",
+          );
+        }
+        const matches = parsed.flatMap((item) => item.blocks).filter(
+          (block) => {
+            if (!block.scheduledDate) return false;
+            if (!args.date) return true;
+            return args.before
+              ? block.scheduledDate < args.date
+              : block.scheduledDate === args.date;
+          },
+        );
+        const scannedAt = new Date().toISOString();
+        const scheduledHandle = await context.writeResource(
+          "scheduled",
+          `scheduled-${args.date ?? "all"}-${args.before ? "before" : "exact"}`,
+          {
+            graphPath,
+            scannedAt,
+            date: args.date ?? null,
+            before: args.before,
+            matchCount: matches.length,
+            items: matches.map((block) => ({ ...block, scannedAt })),
+          },
+        );
+        return { dataHandles: [scheduledHandle] };
       },
     },
   },

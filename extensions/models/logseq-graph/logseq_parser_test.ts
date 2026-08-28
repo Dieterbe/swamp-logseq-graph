@@ -27,3 +27,12 @@ Deno.test("derives page title from Logseq namespace filename", () => {
   assertEquals(result.page.title, "Area/Topic");
   assertEquals(result.blocks[0].id, "pages/Area___Topic.md:1");
 });
+
+Deno.test("marks past scheduled and deadline dates as overdue", () => {
+  const result = parseLogseqFile("pages/Tasks.md", `- Scheduled task\n  scheduled:: 2020-01-02\n- Future task\n  DEADLINE: <2999-12-31>\n`);
+  assertEquals(result.blocks[0].scheduledDate, "2020-01-02");
+  assertEquals(result.blocks[0].overdue, true);
+  assertEquals(result.blocks[1].deadlineDate, "2999-12-31");
+  assertEquals(result.blocks[1].overdue, false);
+  assertEquals(result.page.overdueCount, 1);
+});

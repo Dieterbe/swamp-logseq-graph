@@ -8,6 +8,7 @@ export interface ParsedPage {
   tags: string[];
   blockRefs: string[];
   blockCount: number;
+  overdueCount: number;
 }
 
 /** Parsed Logseq block. */
@@ -22,6 +23,9 @@ export interface ParsedBlock {
   links: string[];
   tags: string[];
   blockRefs: string[];
+  scheduledDate: string | null;
+  deadlineDate: string | null;
+  overdue: boolean;
 }
 
 /** Result of parsing one Markdown file. */
@@ -35,6 +39,8 @@ const BLOCK = /^(\s*)[-*+]\s+(.*)$/;
 const PAGE_REF = /\[\[([^\]]+)\]\]/g;
 const BLOCK_REF = /\(\(([0-9a-fA-F-]{8,})\)\)/g;
 const TAG = /(?:^|\s)#(?:\[\[([^\]]+)\]\]|([\p{L}\p{N}_/-]+))/gu;
+const SCHEDULED = /\bSCHEDULED:\s*<?(\d{4}-\d{2}-\d{2})/i;
+const DEADLINE = /\bDEADLINE:\s*<?(\d{4}-\d{2}-\d{2})/i;
 
 function unique(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))].sort((a, b) =>
@@ -63,6 +69,28 @@ function references(
   };
 }
 
+function taskDates(
+  text: string,
+  properties: Record<string, string>,
+): {
+  scheduledDate: string | null;
+  deadlineDate: string | null;
+  overdue: boolean;
+} {
+  const scheduledDate = text.match(SCHEDULED)?.[1] ??
+    properties.scheduled?.match(/\d{4}-\d{2}-\d{2}/)?.[0] ?? null;
+  const deadlineDate = text.match(DEADLINE)?.[1] ??
+    properties.deadline?.match(/\d{4}-\d{2}-\d{2}/)?.[0] ?? null;
+  const today = new Date().toISOString().slice(0, 10);
+  return {
+    scheduledDate,
+    deadlineDate,
+    overdue: [scheduledDate, deadlineDate].some((date) =>
+      date !== null && date < today
+    ),
+  };
+}
+
 function pageTitle(relativePath: string, source: string): string {
   const titleProperty = source.match(/^title::\s*(.+)$/im)?.[1]?.trim();
   if (titleProperty) return titleProperty;
@@ -88,6 +116,7 @@ export function parseLogseqFile(
       pagePreamble = false;
       const content = blockMatch[2];
       const refs = references(content);
+      const dates = taskDates(content, {});
       const explicitId = content.match(/\bid::\s*([0-9a-fA-F-]{8,})\b/)?.[1];
       current = {
         id: explicitId ?? `${relativePath}:${index + 1}`,
@@ -98,6 +127,7 @@ export function parseLogseqFile(
         content,
         properties: {},
         ...refs,
+        ...dates,
       };
       blocks.push(current);
       continue;
@@ -112,8 +142,19 @@ export function parseLogseqFile(
         if (key === "id" && /^[0-9a-fA-F-]{8,}$/.test(value)) {
           current.id = value;
         }
+        const dates = taskDates("", { [key.toLowerCase()]: value });
+        current.scheduledDate = dates.scheduledDate ?? current.scheduledDate;
+        current.deadlineDate = dates.deadlineDate ?? current.deadlineDate;
+        current.overdue = current.overdue || dates.overdue;
       }
       continue;
+    }
+
+    if (current) {
+      const dates = taskDates(line, {});
+      current.scheduledDate = dates.scheduledDate ?? current.scheduledDate;
+      current.deadlineDate = dates.deadlineDate ?? current.deadlineDate;
+      current.overdue = current.overdue || dates.overdue;
     }
 
     if (line.trim() && !line.trimStart().startsWith("#")) pagePreamble = false;
@@ -121,6 +162,7 @@ export function parseLogseqFile(
 
   const allText = source;
   const refs = references(allText);
+  const overdueCount = blocks.filter((block) => block.overdue).length;
   return {
     page: {
       path: relativePath,
@@ -131,6 +173,7 @@ export function parseLogseqFile(
       tags: refs.tags,
       blockRefs: refs.blockRefs,
       blockCount: blocks.length,
+      overdueCount,
     },
     blocks,
   };
