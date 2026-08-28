@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@dieter/logseq-graph"
+version: "2026.08.28.1"
+description: "Read a local Logseq Markdown graph into typed, queryable page and block resources."
+paths:
+  base: manifest
+models:
+  - logseq_graph.ts
+additionalFiles:
+  - README.md
+  - LICENSE
