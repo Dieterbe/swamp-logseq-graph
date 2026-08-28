@@ -131,14 +131,15 @@ export const model = {
           );
         }
 
-        const parsed = await Promise.all(
-          files.map(async (path) =>
+        const parsed = [];
+        for (const path of files) {
+          parsed.push(
             parseLogseqFile(
               path,
               await Deno.readTextFile(`${graphPath}/${path}`),
-            )
-          ),
-        );
+            ),
+          );
+        }
         const scannedAt = new Date().toISOString();
         const handles: DataHandle[] = [];
         for (const item of parsed) {
