@@ -6,7 +6,7 @@
 import { z } from "npm:zod@4";
 import { parseLogseqFile } from "./logseq_parser.ts";
 
-const VERSION = "2026.08.28.1";
+const VERSION = "2026.08.28.3";
 const GlobalArgsSchema = z.object({
   graphPath: z.string().min(1).describe("Absolute path to the Logseq graph"),
 });
@@ -160,8 +160,10 @@ export const model = {
             );
           }
         }
-        handles.push(
-          await context.writeResource("summary", "summary-current", {
+        const summaryHandle = await context.writeResource(
+          "summary",
+          "summary-current",
+          {
             graphPath,
             scannedAt,
             pageCount: parsed.length,
@@ -169,7 +171,7 @@ export const model = {
               (count, item) => count + item.blocks.length,
               0,
             ),
-          }),
+          },
         );
         context.logger.info(
           "Scanned {pageCount} pages and {blockCount} blocks",
@@ -181,7 +183,9 @@ export const model = {
             ),
           },
         );
-        return { dataHandles: handles };
+        // Writes are persisted individually; return only the compact summary
+        // to keep large-graph reports bounded.
+        return { dataHandles: [summaryHandle] };
       },
     },
   },
