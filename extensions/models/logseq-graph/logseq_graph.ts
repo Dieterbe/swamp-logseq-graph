@@ -4,9 +4,10 @@
  * @module
  */
 import { z } from "npm:zod@4";
+import { findJournalLinks, journalFormats } from "./journal_dates.ts";
 import { parseLogseqFile } from "./logseq_parser.ts";
 
-const VERSION = "2026.08.28.4";
+const VERSION = "2026.09.20.1";
 const GlobalArgsSchema = z.object({
   graphPath: z.string().min(1).describe("Absolute path to the Logseq graph"),
 });
@@ -18,6 +19,12 @@ const ScheduledArgsSchema = z.object({
   ),
 });
 type ScheduledArgs = z.infer<typeof ScheduledArgsSchema>;
+const RewriteJournalLinksArgsSchema = z.object({
+  dryRun: z.boolean().default(true).describe(
+    "Report proposed changes without writing files; defaults to true",
+  ),
+});
+type RewriteJournalLinksArgs = z.infer<typeof RewriteJournalLinksArgsSchema>;
 
 const CommonReferencesSchema = z.object({
   scannedAt: z.iso.datetime(),
@@ -66,6 +73,27 @@ const ScheduledSchema = z.object({
   matchCount: z.number().int().nonnegative(),
   items: z.array(BlockSchema),
 });
+const JournalFormatsSchema = z.object({
+  graphPath: z.string(),
+  scannedAt: z.iso.datetime(),
+  currentFormat: z.string(),
+  formats: z.array(z.object({ format: z.string(), isCurrent: z.boolean() })),
+});
+const JournalLinkSchema = z.object({
+  graphPath: z.string(),
+  scannedAt: z.iso.datetime(),
+  dryRun: z.boolean(),
+  matchCount: z.number().int().nonnegative(),
+  changedFileCount: z.number().int().nonnegative(),
+  matches: z.array(z.object({
+    path: z.string(),
+    line: z.number().int().positive(),
+    content: z.string(),
+    link: z.string(),
+    sourceFormat: z.string(),
+    replacement: z.string(),
+  })),
+});
 
 type DataHandle = { name: string };
 type Context = {
@@ -97,6 +125,19 @@ async function markdownFiles(graphPath: string): Promise<string[]> {
   return files.sort((a, b) => a.localeCompare(b));
 }
 
+async function graphMarkdown(
+  graphPath: string,
+): Promise<Array<{ path: string; source: string }>> {
+  const files: Array<{ path: string; source: string }> = [];
+  for (const path of await markdownFiles(graphPath)) {
+    files.push({
+      path,
+      source: await Deno.readTextFile(`${graphPath}/${path}`),
+    });
+  }
+  return files;
+}
+
 async function resourceName(prefix: string, value: string): Promise<string> {
   const safe = value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(
     /^-|-$/g,
@@ -117,6 +158,14 @@ export const model = {
   type: "@dieter/logseq-graph",
   version: VERSION,
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: VERSION,
+      description:
+        "Add journal title migration methods without changing global arguments.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     page: {
       description: "A Logseq page and its outgoing references",
@@ -145,6 +194,19 @@ export const model = {
     scheduled: {
       description: "Blocks matching a scheduled-date query",
       schema: ScheduledSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    journalFormats: {
+      description: "Current and historical Logseq journal page-title formats",
+      schema: JournalFormatsSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    journalLinks: {
+      description:
+        "Historical journal links found or rewritten by a migration run",
+      schema: JournalLinkSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -273,6 +335,121 @@ export const model = {
           },
         );
         return { dataHandles: [scheduledHandle] };
+      },
+    },
+    journalFormats: {
+      description:
+        "List the current journal page-title format and distinct formats recorded in Git history.",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<string, never>,
+        context: Context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        const formats = await journalFormats(graphPath);
+        const handle = await context.writeResource(
+          "journalFormats",
+          "journal-formats-current",
+          {
+            graphPath,
+            scannedAt: new Date().toISOString(),
+            currentFormat: formats[0].format,
+            formats,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    journalLinks: {
+      description:
+        "Print and store Markdown lines containing journal links in a historical title format.",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<string, never>,
+        context: Context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        const formats = await journalFormats(graphPath);
+        const matches = findJournalLinks(
+          await graphMarkdown(graphPath),
+          formats,
+        );
+        for (const match of matches) {
+          context.logger.info("{path}:{line}: {content}", {
+            path: match.path,
+            line: match.line,
+            content: match.content,
+          });
+        }
+        const handle = await context.writeResource(
+          "journalLinks",
+          "journal-links-current",
+          {
+            graphPath,
+            scannedAt: new Date().toISOString(),
+            dryRun: true,
+            matchCount: matches.length,
+            changedFileCount: 0,
+            matches,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    rewriteJournalLinks: {
+      description:
+        "Rewrite historical journal links using the current title format; dry-run is the default.",
+      arguments: RewriteJournalLinksArgsSchema,
+      execute: async (
+        args: RewriteJournalLinksArgs,
+        context: Context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        const files = await graphMarkdown(graphPath);
+        const matches = findJournalLinks(
+          files,
+          await journalFormats(graphPath),
+        );
+        for (const match of matches) {
+          context.logger.info("{path}:{line}: {content}", {
+            path: match.path,
+            line: match.line,
+            content: match.content,
+          });
+        }
+        const changedPaths = new Set<string>();
+        if (!args.dryRun) {
+          for (const file of files) {
+            const replacements = matches.filter((match) =>
+              match.path === file.path
+            );
+            if (replacements.length === 0) continue;
+            const replacementByLink = new Map(
+              replacements.map((match) => [match.link, match.replacement]),
+            );
+            await Deno.writeTextFile(
+              `${graphPath}/${file.path}`,
+              file.source.replace(
+                /\[\[[^\]]+\]\]/g,
+                (link) => replacementByLink.get(link) ?? link,
+              ),
+            );
+            changedPaths.add(file.path);
+          }
+        }
+        const handle = await context.writeResource(
+          "journalLinks",
+          `journal-links-${args.dryRun ? "dry-run" : "rewritten"}`,
+          {
+            graphPath,
+            scannedAt: new Date().toISOString(),
+            dryRun: args.dryRun,
+            matchCount: matches.length,
+            changedFileCount: changedPaths.size,
+            matches,
+          },
+        );
+        return { dataHandles: [handle] };
       },
     },
   },

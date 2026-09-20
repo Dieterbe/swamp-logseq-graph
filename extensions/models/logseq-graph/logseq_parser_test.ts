@@ -1,4 +1,5 @@
 import { parseLogseqFile } from "./logseq_parser.ts";
+import { findJournalLinks, formatJournalDate, parseJournalDate } from "./journal_dates.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   const left = JSON.stringify(actual);
@@ -35,4 +36,22 @@ Deno.test("marks past scheduled and deadline dates as overdue", () => {
   assertEquals(result.blocks[1].deadlineDate, "2999-12-31");
   assertEquals(result.blocks[1].overdue, false);
   assertEquals(result.page.overdueCount, 1);
+});
+
+Deno.test("parses and formats common Logseq journal title formats", () => {
+  const date = parseJournalDate("Jan 1st, 1970", "MMM do, yyyy");
+  assertEquals(date?.toISOString(), "1970-01-01T00:00:00.000Z");
+  assertEquals(formatJournalDate(date!, "EEE, dd.MM.yyyy"), "Thu, 01.01.1970");
+});
+
+Deno.test("finds only links with historical journal formats", () => {
+  const matches = findJournalLinks([{
+    path: "pages/Notes.md",
+    source: "- [[Jan 1st, 1970]] and [[Thu, 01.01.1970]]",
+  }], [
+    { format: "EEE, dd.MM.yyyy", isCurrent: true },
+    { format: "MMM do, yyyy", isCurrent: false },
+  ]);
+  assertEquals(matches.length, 1);
+  assertEquals(matches[0].replacement, "[[Thu, 01.01.1970]]");
 });
