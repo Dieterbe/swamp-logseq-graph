@@ -14,6 +14,9 @@ export interface JournalLinkMatch {
   replacement: string;
 }
 
+/** Logseq OG's title format when the graph does not configure one. */
+export const DEFAULT_JOURNAL_PAGE_TITLE_FORMAT = "MMM do, yyyy";
+
 const MONTHS = [
   "January",
   "February",
@@ -204,15 +207,23 @@ async function git(graphPath: string, args: string[]): Promise<string> {
   return new TextDecoder().decode(result.stdout);
 }
 
-/** Read the configured title format and every distinct historical format in Git. */
+/**
+ * Read the active title format and every distinct format used in Git history.
+ *
+ * A missing setting means Logseq OG used its built-in default, so it is a
+ * historical format too rather than an unknown value.
+ */
 export async function journalFormats(
   graphPath: string,
 ): Promise<JournalFormat[]> {
   const configPath = `${graphPath.replace(/\/$/, "")}/logseq/config.edn`;
-  const current = formatFromConfig(await Deno.readTextFile(configPath));
-  if (!current) {
-    throw new Error(`No :journal/page-title-format found in ${configPath}`);
+  let config = "";
+  try {
+    config = await Deno.readTextFile(configPath);
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
   }
+  const current = formatFromConfig(config) ?? DEFAULT_JOURNAL_PAGE_TITLE_FORMAT;
 
   const commits =
     (await git(graphPath, ["log", "--format=%H", "--", "logseq/config.edn"]))
@@ -226,8 +237,10 @@ export async function journalFormats(
       stderr: "null",
     }).output();
     if (!result.success) continue;
-    const format = formatFromConfig(new TextDecoder().decode(result.stdout));
-    if (format) formats.add(format);
+    formats.add(
+      formatFromConfig(new TextDecoder().decode(result.stdout)) ??
+        DEFAULT_JOURNAL_PAGE_TITLE_FORMAT,
+    );
   }
   formats.delete(current);
   return [

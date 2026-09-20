@@ -1,3 +1,4 @@
+import { journalFormats } from "./journal_dates.ts";
 import { model } from "./logseq_graph.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -88,7 +89,7 @@ Deno.test("scheduled selects exact dates and earlier dates", async () => {
 
 Deno.test("journal links reports and rewrites historical titles", async () => {
   await withTempGraph({
-    "logseq/config.edn": ':journal/page-title-format "MMM do, yyyy"\n',
+    "logseq/config.edn": "{:meta/version 1}\n",
     "pages/Notes.md": "- Link [[Jan 1st, 1970]] and [[Other]]\n",
   }, async (graphPath) => {
     const command = new Deno.Command("git", { args: ["init", "-q"], cwd: graphPath });
@@ -101,6 +102,13 @@ Deno.test("journal links reports and rewrites historical titles", async () => {
     await Deno.writeTextFile(`${graphPath}/logseq/config.edn`, ':journal/page-title-format "EEE, dd.MM.yyyy"\n');
     await new Deno.Command("git", { args: ["add", "."], cwd: graphPath }).output();
     await new Deno.Command("git", { args: ["commit", "-qm", "new format"], cwd: graphPath }).output();
+
+    const formats = await journalFormats(graphPath);
+    assert(formats[0].format === "EEE, dd.MM.yyyy", "configured format should be current");
+    assert(
+      formats.some((format) => format.format === "MMM do, yyyy" && !format.isCurrent),
+      "an unconfigured historical revision should contribute Logseq's default format",
+    );
 
     const writes: Array<{ specName: string; data: Record<string, unknown> }> = [];
     const context = {
@@ -118,5 +126,20 @@ Deno.test("journal links reports and rewrites historical titles", async () => {
     writes.length = 0;
     await model.methods.rewriteJournalLinks.execute({ dryRun: false }, context);
     assert((await Deno.readTextFile(`${graphPath}/pages/Notes.md`)).includes("[[Thu, 01.01.1970]]"), "rewrite should use the current format");
+  });
+});
+
+Deno.test("journal formats use Logseq's default when no config file exists", async () => {
+  await withTempGraph({ "pages/Notes.md": "- Note\n" }, async (graphPath) => {
+    await new Deno.Command("git", { args: ["init", "-q"], cwd: graphPath }).output();
+    for (const [name, value] of [["user.email", "test@example.com"], ["user.name", "Test"]]) {
+      await new Deno.Command("git", { args: ["config", name, value], cwd: graphPath }).output();
+    }
+    await new Deno.Command("git", { args: ["add", "."], cwd: graphPath }).output();
+    await new Deno.Command("git", { args: ["commit", "-qm", "initial"], cwd: graphPath }).output();
+    const formats = await journalFormats(graphPath);
+    assert(formats.length === 1, "an unconfigured graph should have one effective format");
+    assert(formats[0].format === "MMM do, yyyy", "the effective format should be Logseq's default");
+    assert(formats[0].isCurrent, "the default should be current");
   });
 });

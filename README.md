@@ -52,9 +52,12 @@ No graph content is sent over the network. All methods except the explicit
 
 `journalFormats` reads the current `:journal/page-title-format` from
 `logseq/config.edn` and distinct earlier values from that file's Git history.
-Git history is the source of truth because it records formats that were in use
-when existing links were created; inspecting only the working-tree setting
-would miss them.
+When that setting is absent—either now or in a historical revision—it reports
+Logseq OG's implicit default, `MMM do, yyyy`. This treats the long common
+period before an explicit setting as a real journal-title format, so links such
+as `[[Jan 1st, 1970]]` can be found and migrated. Git history remains the
+source of truth for explicit values because inspecting only the working-tree
+setting would miss them.
 
 ```sh
 swamp model method run my-graph journalFormats

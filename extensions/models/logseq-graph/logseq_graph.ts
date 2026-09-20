@@ -7,7 +7,7 @@ import { z } from "npm:zod@4";
 import { findJournalLinks, journalFormats } from "./journal_dates.ts";
 import { parseLogseqFile } from "./logseq_parser.ts";
 
-const VERSION = "2026.09.20.1";
+const VERSION = "2026.09.20.2";
 const GlobalArgsSchema = z.object({
   graphPath: z.string().min(1).describe("Absolute path to the Logseq graph"),
 });
