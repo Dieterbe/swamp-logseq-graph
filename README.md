@@ -85,6 +85,44 @@ tokens used for journal titles: weekday (`EEE`/`EEEE`), day (`d`, `dd`, `do`),
 month (`M`, `MM`, `MMM`, `MMMM`), year (`yy`, `yyyy`), literals, and quoted
 literals. Other date-fns tokens are not migrated rather than being guessed.
 
+## Namespace-to-property conversion
+
+`convertNamespaceToPropertyBasedItems` converts references and page titles from
+a specified namespace into standalone pages with a specified property. It
+renames matching page files and creates a page when a reference has no file.
+Underscores, hyphens, and lower-to-upper camel-case boundaries become spaces.
+
+`namespace`, `propertyKey`, and `propertyValue` are required so the method
+does not impose a page category or classification. For example, `people`,
+`type`, and `[[Person]]` convert `[[people/John_Doe]]` to `[[John Doe]]` and
+classify the resulting page as a person.
+
+The method is dry-run by default because it rewrites Markdown and renames page
+files. It refuses target-page collisions instead of merging page content, since
+merging would require choosing how to resolve conflicting properties and blocks.
+
+```sh
+# Review the conversion first
+swamp model method run my-graph convertNamespaceToPropertyBasedItems \
+  --input namespace=contacts --input propertyKey=kind \
+  --input propertyValue='[[Contact]]'
+
+# Apply the previewed conversion
+swamp model method run my-graph convertNamespaceToPropertyBasedItems --input dryRun=false \
+  --input namespace=contacts --input propertyKey=kind \
+  --input propertyValue='[[Contact]]'
+
+# Override a generated title when formatting alone cannot infer it
+swamp model method run my-graph convertNamespaceToPropertyBasedItems --input dryRun=false \
+  --input namespace=contacts --input propertyKey=kind \
+  --input propertyValue='[[Contact]]' \
+  --input '{"titleMappings":{"contacts/AdrienSmit":"Adrian Smith"}}'
+```
+
+Use `titleMappings` for title corrections. The method intentionally does not
+guess corrections: formatting is deterministic, whereas a guessed correction
+could retitle the wrong item.
+
 ## Supported Logseq syntax
 
 - Page and namespace names, including `___` namespace filenames

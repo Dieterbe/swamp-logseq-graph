@@ -7,7 +7,7 @@ import { z } from "npm:zod@4";
 import { findJournalLinks, journalFormats } from "./journal_dates.ts";
 import { parseLogseqFile } from "./logseq_parser.ts";
 
-const VERSION = "2026.09.20.2";
+const VERSION = "2026.10.07.1";
 const GlobalArgsSchema = z.object({
   graphPath: z.string().min(1).describe("Absolute path to the Logseq graph"),
 });
@@ -25,6 +25,25 @@ const RewriteJournalLinksArgsSchema = z.object({
   ),
 });
 type RewriteJournalLinksArgs = z.infer<typeof RewriteJournalLinksArgsSchema>;
+const ConvertNamespaceToPropertyBasedItemsArgsSchema = z.object({
+  dryRun: z.boolean().default(true).describe(
+    "Report proposed changes without writing files; defaults to true",
+  ),
+  namespace: z.string().min(1).describe(
+    "Namespace to remove from page references and page titles",
+  ),
+  propertyKey: z.string().regex(/^[\p{L}\p{N}_-]+$/u)
+    .describe("Page property key to add or update"),
+  propertyValue: z.string().min(1).describe(
+    "Page property value to add or update",
+  ),
+  titleMappings: z.record(z.string(), z.string()).default({}).describe(
+    "Explicit replacements keyed by the unqualified name or <namespace>/<name>; use this for spell corrections that cannot be inferred from underscores or camel case",
+  ),
+});
+type ConvertNamespaceToPropertyBasedItemsArgs = z.infer<
+  typeof ConvertNamespaceToPropertyBasedItemsArgsSchema
+>;
 
 const CommonReferencesSchema = z.object({
   scannedAt: z.iso.datetime(),
@@ -94,6 +113,19 @@ const JournalLinkSchema = z.object({
     replacement: z.string(),
   })),
 });
+const NamespaceConversionSchema = z.object({
+  graphPath: z.string(),
+  scannedAt: z.iso.datetime(),
+  dryRun: z.boolean(),
+  matchCount: z.number().int().nonnegative(),
+  changedFileCount: z.number().int().nonnegative(),
+  createdPageCount: z.number().int().nonnegative(),
+  renamedPageCount: z.number().int().nonnegative(),
+  matches: z.array(z.object({
+    source: z.string(),
+    target: z.string(),
+  })),
+});
 
 type DataHandle = { name: string };
 type Context = {
@@ -136,6 +168,57 @@ async function graphMarkdown(
     });
   }
   return files;
+}
+
+function humanizeItemTitle(name: string): string {
+  return name.replace(/[_-]+/g, " ")
+    .replace(/([\p{Ll}\d])([\p{Lu}])/gu, "$1 $2")
+    .replace(/\s+/g, " ")
+    .replace(
+      /(^|\s)(\p{Ll})/gu,
+      (_match, prefix, letter) => `${prefix}${letter.toLocaleUpperCase()}`,
+    )
+    .trim();
+}
+
+function itemTitle(
+  name: string,
+  titleMappings: Record<string, string>,
+  namespace: string,
+): string {
+  const title = titleMappings[`${namespace}/${name}`] ??
+    titleMappings[name] ?? humanizeItemTitle(name);
+  if (!title || /[\\/\0]/.test(title)) {
+    throw new Error(`Invalid page title for ${namespace}/${name}`);
+  }
+  return title;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function withProperty(source: string, key: string, value: string): string {
+  const lines = source.split(/\r?\n/);
+  const firstBlock = lines.findIndex((line) => /^\s*[-*+]\s+/.test(line));
+  const preambleEnd = firstBlock === -1 ? lines.length : firstBlock;
+  const property = new RegExp(`^\\s*${escapeRegExp(key)}::\\s*`, "i");
+  for (let index = 0; index < preambleEnd; index++) {
+    if (property.test(lines[index])) {
+      lines[index] = `${key}:: ${value}`;
+      return lines.join("\n");
+    }
+  }
+  return [`${key}:: ${value}`, ...lines].join("\n");
+}
+
+function namespacedReferences(source: string, namespace: string): string[] {
+  const expression = new RegExp(
+    `\\[\\[${escapeRegExp(namespace)}\\/([^\\]\\/]+)\\]\\]`,
+    "gi",
+  );
+  return [...source.matchAll(expression)].map((match) => match[1].trim())
+    .filter(Boolean);
 }
 
 async function resourceName(prefix: string, value: string): Promise<string> {
@@ -207,6 +290,13 @@ export const model = {
       description:
         "Historical journal links found or rewritten by a migration run",
       schema: JournalLinkSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    namespaceConversion: {
+      description:
+        "Planned or applied conversion of namespaced pages and references into property-based items",
+      schema: NamespaceConversionSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -446,6 +536,169 @@ export const model = {
             dryRun: args.dryRun,
             matchCount: matches.length,
             changedFileCount: changedPaths.size,
+            matches,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    convertNamespaceToPropertyBasedItems: {
+      description:
+        "Convert references in a configurable namespace into un-namespaced pages and add a configurable page property; dry-run is the default.",
+      arguments: ConvertNamespaceToPropertyBasedItemsArgsSchema,
+      execute: async (
+        args: ConvertNamespaceToPropertyBasedItemsArgs,
+        context: Context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        const namespace = args.namespace.replace(/^\/+|\/+$/g, "");
+        const propertyKey = args.propertyKey;
+        const propertyValue = args.propertyValue;
+        if (!namespace || namespace.split("/").some((part) => !part)) {
+          throw new Error("namespace must not contain empty path segments");
+        }
+        const files = await graphMarkdown(graphPath);
+        const itemTitles = new Map<string, string>();
+        for (const file of files) {
+          for (const name of namespacedReferences(file.source, namespace)) {
+            itemTitles.set(
+              name,
+              itemTitle(name, args.titleMappings, namespace),
+            );
+          }
+          if (file.path.startsWith("pages/")) {
+            const page = parseLogseqFile(file.path, file.source).page;
+            if (
+              page.title.toLocaleLowerCase().startsWith(
+                `${namespace}/`.toLocaleLowerCase(),
+              )
+            ) {
+              const name = page.title.slice(namespace.length + 1);
+              itemTitles.set(
+                name,
+                itemTitle(name, args.titleMappings, namespace),
+              );
+            }
+          }
+        }
+
+        const matches = [...itemTitles.entries()].map(([name, target]) => ({
+          source: `${namespace}/${name}`,
+          target,
+        })).sort((left, right) => left.source.localeCompare(right.source));
+        const replacementBySource = new Map(
+          matches.map((match) => [match.source, `[[${match.target}]]`]),
+        );
+        const sourcePages = new Map<string, typeof files[number]>();
+        const existingTitles = new Map<string, typeof files[number]>();
+        for (
+          const file of files.filter((file) => file.path.startsWith("pages/"))
+        ) {
+          const title = parseLogseqFile(file.path, file.source).page.title;
+          existingTitles.set(title.toLocaleLowerCase(), file);
+          if (
+            title.toLocaleLowerCase().startsWith(
+              `${namespace}/`.toLocaleLowerCase(),
+            )
+          ) {
+            const target = itemTitle(
+              title.slice(namespace.length + 1),
+              args.titleMappings,
+              namespace,
+            );
+            const prior = sourcePages.get(target.toLocaleLowerCase());
+            if (prior && prior.path !== file.path) {
+              throw new Error(
+                `Cannot normalize both ${prior.path} and ${file.path} to [[${target}]]`,
+              );
+            }
+            sourcePages.set(target.toLocaleLowerCase(), file);
+          }
+        }
+        for (const target of new Set(matches.map((match) => match.target))) {
+          const source = sourcePages.get(target.toLocaleLowerCase());
+          const existing = existingTitles.get(target.toLocaleLowerCase());
+          if (source && existing && source.path !== existing.path) {
+            throw new Error(
+              `Cannot normalize ${source.path}: page [[${target}]] already exists at ${existing.path}`,
+            );
+          }
+        }
+
+        const changedPaths = new Set<string>();
+        let createdPageCount = 0;
+        let renamedPageCount = 0;
+        if (!args.dryRun) {
+          for (const file of files) {
+            const rewritten = file.source.replace(
+              new RegExp(
+                `\\[\\[${escapeRegExp(namespace)}\\/([^\\]\\/]+)\\]\\]`,
+                "gi",
+              ),
+              (link, name) =>
+                replacementBySource.get(`${namespace}/${name.trim()}`) ?? link,
+            );
+            if (rewritten !== file.source) {
+              await Deno.writeTextFile(`${graphPath}/${file.path}`, rewritten);
+              changedPaths.add(file.path);
+            }
+          }
+          for (const target of new Set(matches.map((match) => match.target))) {
+            const source = sourcePages.get(target.toLocaleLowerCase());
+            if (source) {
+              const targetPath = `pages/${target}.md`;
+              const typed = withProperty(
+                await Deno.readTextFile(`${graphPath}/${source.path}`),
+                propertyKey,
+                propertyValue,
+              );
+              await Deno.writeTextFile(`${graphPath}/${source.path}`, typed);
+              changedPaths.add(source.path);
+              if (source.path !== targetPath) {
+                await Deno.rename(
+                  `${graphPath}/${source.path}`,
+                  `${graphPath}/${targetPath}`,
+                );
+                changedPaths.delete(source.path);
+                changedPaths.add(targetPath);
+                renamedPageCount++;
+              }
+            } else {
+              const existing = existingTitles.get(target.toLocaleLowerCase());
+              if (existing) {
+                const typed = withProperty(
+                  await Deno.readTextFile(`${graphPath}/${existing.path}`),
+                  propertyKey,
+                  propertyValue,
+                );
+                await Deno.writeTextFile(
+                  `${graphPath}/${existing.path}`,
+                  typed,
+                );
+                changedPaths.add(existing.path);
+                continue;
+              }
+              const targetPath = `pages/${target}.md`;
+              await Deno.writeTextFile(
+                `${graphPath}/${targetPath}`,
+                `${propertyKey}:: ${propertyValue}\n`,
+              );
+              changedPaths.add(targetPath);
+              createdPageCount++;
+            }
+          }
+        }
+        const handle = await context.writeResource(
+          "namespaceConversion",
+          `namespace-conversion-${args.dryRun ? "dry-run" : "rewritten"}`,
+          {
+            graphPath,
+            scannedAt: new Date().toISOString(),
+            dryRun: args.dryRun,
+            matchCount: matches.length,
+            changedFileCount: changedPaths.size,
+            createdPageCount,
+            renamedPageCount,
             matches,
           },
         );
