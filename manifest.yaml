@@ -1,6 +1,7 @@
 manifestVersion: 1
 name: "@dieter/logseq-graph"
-version: "2026.10.07.1"
+version: "2026.11.05.1"
+license: MIT
 description: "Read a local Logseq Markdown graph into typed, queryable page and block resources."
 repository: "https://github.com/Dieterbe/swamp-logseq-graph"
 paths:

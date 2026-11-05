@@ -7,7 +7,6 @@ import { z } from "npm:zod@4";
 import { findJournalLinks, journalFormats } from "./journal_dates.ts";
 import { parseLogseqFile } from "./logseq_parser.ts";
 
-const VERSION = "2026.10.07.1";
 const GlobalArgsSchema = z.object({
   graphPath: z.string().min(1).describe("Absolute path to the Logseq graph"),
 });
@@ -37,12 +36,30 @@ const ConvertNamespaceToPropertyBasedItemsArgsSchema = z.object({
   propertyValue: z.string().min(1).describe(
     "Page property value to add or update",
   ),
+  mergeExistingPages: z.boolean().default(false).describe(
+    "Merge a namespaced page into an existing page with the target title",
+  ),
   titleMappings: z.record(z.string(), z.string()).default({}).describe(
     "Explicit replacements keyed by the unqualified name or <namespace>/<name>; use this for spell corrections that cannot be inferred from underscores or camel case",
   ),
 });
 type ConvertNamespaceToPropertyBasedItemsArgs = z.infer<
   typeof ConvertNamespaceToPropertyBasedItemsArgsSchema
+>;
+const UpdatePagePropertyAndTagArgsSchema = z.object({
+  propertyKey: z.string().regex(/^[\p{L}\p{N}_-]+$/u).describe(
+    "Page property key to match and update",
+  ),
+  fromValue: z.string().min(1).describe("Current property value to match"),
+  toValue: z.string().min(1).describe("Replacement property value"),
+  tag: z.string().regex(/^#?[\p{L}\p{N}_/-]+$/u).describe(
+    "Tag to add to the tags page property, with or without a leading #",
+  ),
+  tagsProperty: z.string().regex(/^[\p{L}\p{N}_-]+$/u).default("tags")
+    .describe("Page property containing tags"),
+});
+type UpdatePagePropertyAndTagArgs = z.infer<
+  typeof UpdatePagePropertyAndTagArgsSchema
 >;
 
 const CommonReferencesSchema = z.object({
@@ -121,10 +138,22 @@ const NamespaceConversionSchema = z.object({
   changedFileCount: z.number().int().nonnegative(),
   createdPageCount: z.number().int().nonnegative(),
   renamedPageCount: z.number().int().nonnegative(),
+  mergedPageCount: z.number().int().nonnegative(),
   matches: z.array(z.object({
     source: z.string(),
     target: z.string(),
   })),
+});
+const PagePropertyUpdateSchema = z.object({
+  graphPath: z.string(),
+  scannedAt: z.iso.datetime(),
+  matchCount: z.number().int().nonnegative(),
+  changedFileCount: z.number().int().nonnegative(),
+  propertyKey: z.string(),
+  fromValue: z.string(),
+  toValue: z.string(),
+  tag: z.string(),
+  matches: z.array(z.object({ path: z.string(), title: z.string() })),
 });
 
 type DataHandle = { name: string };
@@ -212,6 +241,143 @@ function withProperty(source: string, key: string, value: string): string {
   return [`${key}:: ${value}`, ...lines].join("\n");
 }
 
+function mergePageSources(
+  targetSource: string,
+  incomingSource: string,
+  targetTitle: string,
+  sourceTitle: string,
+  propertyKey: string,
+  propertyValue: string,
+): string {
+  const targetPage =
+    parseLogseqFile(`pages/${targetTitle}.md`, targetSource).page;
+  const incomingPage = parseLogseqFile(
+    `pages/${sourceTitle.replace(/\//g, "___")}.md`,
+    incomingSource,
+  ).page;
+  const targetProperties = new Map(
+    Object.entries(targetPage.properties).map(([key, value]) => [
+      key.toLocaleLowerCase(),
+      { key, value },
+    ]),
+  );
+  for (const [key, value] of Object.entries(incomingPage.properties)) {
+    const normalizedKey = key.toLocaleLowerCase();
+    if (normalizedKey === propertyKey.toLocaleLowerCase()) continue;
+    const target = targetProperties.get(normalizedKey);
+    if (target && target.value !== value) {
+      throw new Error(
+        `Cannot merge ${sourceTitle} into ${targetTitle}: property ${key} has conflicting values (${target.value} and ${value})`,
+      );
+    }
+  }
+
+  const targetLines = withProperty(targetSource, propertyKey, propertyValue)
+    .split(/\r?\n/);
+  const targetFirstBlock = targetLines.findIndex((line) =>
+    /^\s*[-*+]\s+/.test(line)
+  );
+  const targetPreambleEnd = targetFirstBlock === -1
+    ? targetLines.length
+    : targetFirstBlock;
+  const targetKeys = new Set(
+    Object.keys(targetPage.properties).map((key) => key.toLocaleLowerCase()),
+  );
+  const incomingLines = incomingSource.split(/\r?\n/);
+  const incomingFirstBlock = incomingLines.findIndex((line) =>
+    /^\s*[-*+]\s+/.test(line)
+  );
+  const incomingPreambleEnd = incomingFirstBlock === -1
+    ? incomingLines.length
+    : incomingFirstBlock;
+  const propertyLine = /^\s*([\p{L}\p{N}_-]+)::\s*(.*)$/u;
+  const addedProperties: string[] = [];
+  for (const line of incomingLines.slice(0, incomingPreambleEnd)) {
+    const match = line.match(propertyLine);
+    if (!match) continue;
+    const [, key] = match;
+    const normalizedKey = key.toLocaleLowerCase();
+    if (
+      normalizedKey === propertyKey.toLocaleLowerCase() ||
+      targetKeys.has(normalizedKey)
+    ) continue;
+    addedProperties.push(line);
+    targetKeys.add(normalizedKey);
+  }
+  if (addedProperties.length > 0) {
+    targetLines.splice(targetPreambleEnd, 0, ...addedProperties);
+  }
+
+  const incomingPreambleContent = incomingLines.slice(0, incomingPreambleEnd)
+    .filter((line) => !propertyLine.test(line)).join("\n").trim();
+  const incomingBody = [
+    incomingPreambleContent,
+    incomingLines.slice(incomingPreambleEnd).join("\n").trim(),
+  ].filter(Boolean).join("\n\n");
+  const marker = `- Merged content from ${sourceTitle}`;
+  if (!incomingBody || targetSource.includes(marker)) {
+    return targetLines.join("\n");
+  }
+  return `${targetLines.join("\n").trimEnd()}\n${marker}\n${incomingBody}\n`;
+}
+
+function normalizedPropertyValue(value: string): string {
+  return value.trim().replace(/^\[\[(.*)\]\]$/u, "$1").trim()
+    .toLocaleLowerCase();
+}
+
+function updatePagePropertyAndTag(
+  source: string,
+  propertyKey: string,
+  fromValue: string,
+  toValue: string,
+  tagsProperty: string,
+  tag: string,
+): string {
+  const lines = source.split(/\r?\n/);
+  const firstBlock = lines.findIndex((line) => /^\s*[-*+]\s+/.test(line));
+  const preambleEnd = firstBlock === -1 ? lines.length : firstBlock;
+  const property = new RegExp(
+    `^\\s*(${escapeRegExp(propertyKey)})::\\s*(.*)$`,
+    "i",
+  );
+  const tags = new RegExp(
+    `^\\s*(${escapeRegExp(tagsProperty)})::\\s*(.*)$`,
+    "i",
+  );
+  let matched = false;
+  let tagsFound = false;
+  for (let index = 0; index < preambleEnd; index++) {
+    const propertyMatch = lines[index].match(property);
+    if (
+      propertyMatch &&
+      normalizedPropertyValue(propertyMatch[2]) ===
+        normalizedPropertyValue(fromValue)
+    ) {
+      lines[index] = `${propertyKey}:: ${toValue}`;
+      matched = true;
+      continue;
+    }
+    const tagsMatch = lines[index].match(tags);
+    if (tagsMatch) {
+      tagsFound = true;
+      const existingTags = tagsMatch[2];
+      const alreadyPresent = new RegExp(
+        `(?:^|[\\s,])#?${escapeRegExp(tag.replace(/^#/, ""))}(?=$|[\\s,])`,
+        "i",
+      ).test(existingTags);
+      if (!alreadyPresent) {
+        lines[index] = `${tagsProperty}:: ${existingTags.trim()}${
+          existingTags.trim() ? " " : ""
+        }${tag}`;
+      }
+    }
+  }
+  if (!matched) return source;
+  if (!tagsFound) lines.splice(preambleEnd, 0, `${tagsProperty}:: ${tag}`);
+  return lines.join("\n");
+}
+
 function namespacedReferences(source: string, namespace: string): string[] {
   const expression = new RegExp(
     `\\[\\[${escapeRegExp(namespace)}\\/([^\\]\\/]+)\\]\\]`,
@@ -239,16 +405,50 @@ async function resourceName(prefix: string, value: string): Promise<string> {
 /** Logseq graph reader model. */
 export const model = {
   type: "@dieter/logseq-graph",
-  version: VERSION,
+  version: "2026.11.05.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
-      toVersion: VERSION,
+      toVersion: "2026.11.05.3",
       description:
-        "Add journal title migration methods without changing global arguments.",
+        "Add property-based page migration and merge support without changing global arguments.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
+  checks: [{
+    "graph-pages-directory": {
+      description:
+        "Ensure the configured graph has a readable pages directory before a page migration",
+      labels: ["dependency"],
+      appliesTo: [
+        "convertNamespaceToPropertyBasedItems",
+        "updatePagePropertyAndTag",
+      ],
+      execute: async (context: { globalArgs: GlobalArgs }) => {
+        const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        try {
+          const info = await Deno.stat(`${graphPath}/pages`);
+          if (!info.isDirectory) {
+            return {
+              pass: false,
+              errors: [`${graphPath}/pages is not a directory`],
+            };
+          }
+          for await (const _entry of Deno.readDir(`${graphPath}/pages`)) break;
+          return { pass: true };
+        } catch (error) {
+          return {
+            pass: false,
+            errors: [
+              `Cannot read ${graphPath}/pages: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            ],
+          };
+        }
+      },
+    },
+  }],
   resources: {
     page: {
       description: "A Logseq page and its outgoing references",
@@ -297,6 +497,13 @@ export const model = {
       description:
         "Planned or applied conversion of namespaced pages and references into property-based items",
       schema: NamespaceConversionSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    pagePropertyUpdate: {
+      description:
+        "Pages selected by an existing property value, with that value updated and a tag added",
+      schema: PagePropertyUpdateSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -387,6 +594,9 @@ export const model = {
         context: Context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        context.logger.info("Finding scheduled blocks in {graphPath}", {
+          graphPath,
+        });
         const files = await markdownFiles(graphPath);
         const parsed = [];
         for (const path of files) {
@@ -424,6 +634,9 @@ export const model = {
             items: matches.map((block) => ({ ...block, scannedAt })),
           },
         );
+        context.logger.info("Found {matchCount} scheduled blocks", {
+          matchCount: matches.length,
+        });
         return { dataHandles: [scheduledHandle] };
       },
     },
@@ -436,6 +649,9 @@ export const model = {
         context: Context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        context.logger.info("Reading journal formats from {graphPath}", {
+          graphPath,
+        });
         const formats = await journalFormats(graphPath);
         const handle = await context.writeResource(
           "journalFormats",
@@ -447,6 +663,9 @@ export const model = {
             formats,
           },
         );
+        context.logger.info("Found {formatCount} journal formats", {
+          formatCount: formats.length,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -459,6 +678,9 @@ export const model = {
         context: Context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        context.logger.info("Finding historical journal links in {graphPath}", {
+          graphPath,
+        });
         const formats = await journalFormats(graphPath);
         const matches = findJournalLinks(
           await graphMarkdown(graphPath),
@@ -483,6 +705,9 @@ export const model = {
             matches,
           },
         );
+        context.logger.info("Found {matchCount} historical journal links", {
+          matchCount: matches.length,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -495,6 +720,10 @@ export const model = {
         context: Context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        context.logger.info(
+          "Rewriting historical journal links in {graphPath}",
+          { graphPath },
+        );
         const files = await graphMarkdown(graphPath);
         const matches = findJournalLinks(
           files,
@@ -539,6 +768,10 @@ export const model = {
             matches,
           },
         );
+        context.logger.info(
+          "Journal link rewrite completed: {changedFileCount} files changed",
+          { changedFileCount: changedPaths.size },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -551,6 +784,10 @@ export const model = {
         context: Context,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        context.logger.info("Converting namespace {namespace} in {graphPath}", {
+          namespace: args.namespace,
+          graphPath,
+        });
         const namespace = args.namespace.replace(/^\/+|\/+$/g, "");
         const propertyKey = args.propertyKey;
         const propertyValue = args.propertyValue;
@@ -618,32 +855,82 @@ export const model = {
         for (const target of new Set(matches.map((match) => match.target))) {
           const source = sourcePages.get(target.toLocaleLowerCase());
           const existing = existingTitles.get(target.toLocaleLowerCase());
-          if (source && existing && source.path !== existing.path) {
+          if (
+            source && existing && source.path !== existing.path &&
+            !args.mergeExistingPages
+          ) {
             throw new Error(
               `Cannot normalize ${source.path}: page [[${target}]] already exists at ${existing.path}`,
             );
           }
         }
 
+        const rewrittenByPath = new Map(files.map((file) => [
+          file.path,
+          file.source.replace(
+            new RegExp(
+              `\\[\\[${escapeRegExp(namespace)}\\/([^\\]\\/]+)\\]\\]`,
+              "gi",
+            ),
+            (link, name) =>
+              replacementBySource.get(`${namespace}/${name.trim()}`) ?? link,
+          ),
+        ]));
+        const mergePlans = new Map<string, {
+          sourcePath: string;
+          targetPath: string;
+          content: string;
+        }>();
+        for (const target of new Set(matches.map((match) => match.target))) {
+          const source = sourcePages.get(target.toLocaleLowerCase());
+          const existing = existingTitles.get(target.toLocaleLowerCase());
+          if (!source || !existing || source.path === existing.path) continue;
+          const sourceTitle =
+            parseLogseqFile(source.path, source.source).page.title;
+          const content = mergePageSources(
+            rewrittenByPath.get(existing.path) ?? existing.source,
+            rewrittenByPath.get(source.path) ?? source.source,
+            target,
+            sourceTitle,
+            propertyKey,
+            propertyValue,
+          );
+          mergePlans.set(target.toLocaleLowerCase(), {
+            sourcePath: source.path,
+            targetPath: existing.path,
+            content,
+          });
+        }
+
         const changedPaths = new Set<string>();
         let createdPageCount = 0;
         let renamedPageCount = 0;
+        let mergedPageCount = 0;
         if (!args.dryRun) {
           for (const file of files) {
-            const rewritten = file.source.replace(
-              new RegExp(
-                `\\[\\[${escapeRegExp(namespace)}\\/([^\\]\\/]+)\\]\\]`,
-                "gi",
-              ),
-              (link, name) =>
-                replacementBySource.get(`${namespace}/${name.trim()}`) ?? link,
-            );
+            if (
+              [...mergePlans.values()].some((plan) =>
+                plan.sourcePath === file.path || plan.targetPath === file.path
+              )
+            ) continue;
+            const rewritten = rewrittenByPath.get(file.path) ?? file.source;
             if (rewritten !== file.source) {
               await Deno.writeTextFile(`${graphPath}/${file.path}`, rewritten);
               changedPaths.add(file.path);
             }
           }
+          for (const plan of mergePlans.values()) {
+            await Deno.writeTextFile(
+              `${graphPath}/${plan.targetPath}`,
+              plan.content,
+            );
+            await Deno.remove(`${graphPath}/${plan.sourcePath}`);
+            changedPaths.add(plan.targetPath);
+            changedPaths.add(plan.sourcePath);
+            mergedPageCount++;
+          }
           for (const target of new Set(matches.map((match) => match.target))) {
+            if (mergePlans.has(target.toLocaleLowerCase())) continue;
             const source = sourcePages.get(target.toLocaleLowerCase());
             if (source) {
               const targetPath = `pages/${target}.md`;
@@ -699,8 +986,82 @@ export const model = {
             changedFileCount: changedPaths.size,
             createdPageCount,
             renamedPageCount,
+            mergedPageCount,
             matches,
           },
+        );
+        context.logger.info(
+          "Namespace conversion completed: {matchCount} matches, {changedFileCount} files changed",
+          { matchCount: matches.length, changedFileCount: changedPaths.size },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    updatePagePropertyAndTag: {
+      description:
+        "Update matching page properties and add a tag to each matching page",
+      arguments: UpdatePagePropertyAndTagArgsSchema,
+      execute: async (
+        args: UpdatePagePropertyAndTagArgs,
+        context: Context,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const graphPath = context.globalArgs.graphPath.replace(/\/$/, "");
+        context.logger.info(
+          "Updating pages with {propertyKey}={fromValue} in {graphPath}",
+          {
+            propertyKey: args.propertyKey,
+            fromValue: args.fromValue,
+            graphPath,
+          },
+        );
+        const propertyKey = args.propertyKey;
+        const tag = args.tag.startsWith("#") ? args.tag : `#${args.tag}`;
+        const matches: Array<{ path: string; title: string }> = [];
+        let changedFileCount = 0;
+        for (const file of await graphMarkdown(graphPath)) {
+          if (!file.path.startsWith("pages/")) continue;
+          const page = parseLogseqFile(file.path, file.source).page;
+          const propertyValue = Object.entries(page.properties).find(
+            ([key]) =>
+              key.toLocaleLowerCase() === propertyKey.toLocaleLowerCase(),
+          )?.[1];
+          if (
+            propertyValue === undefined ||
+            normalizedPropertyValue(propertyValue) !==
+              normalizedPropertyValue(args.fromValue)
+          ) continue;
+          matches.push({ path: file.path, title: page.title });
+          const updated = updatePagePropertyAndTag(
+            file.source,
+            propertyKey,
+            args.fromValue,
+            args.toValue,
+            args.tagsProperty,
+            tag,
+          );
+          if (updated !== file.source) {
+            await Deno.writeTextFile(`${graphPath}/${file.path}`, updated);
+            changedFileCount++;
+          }
+        }
+        const handle = await context.writeResource(
+          "pagePropertyUpdate",
+          `page-property-update-${propertyKey.toLowerCase()}-${args.fromValue.toLowerCase()}`,
+          {
+            graphPath,
+            scannedAt: new Date().toISOString(),
+            matchCount: matches.length,
+            changedFileCount,
+            propertyKey,
+            fromValue: args.fromValue,
+            toValue: args.toValue,
+            tag,
+            matches,
+          },
+        );
+        context.logger.info(
+          "Page property update completed: {matchCount} matches, {changedFileCount} files changed",
+          { matchCount: matches.length, changedFileCount },
         );
         return { dataHandles: [handle] };
       },

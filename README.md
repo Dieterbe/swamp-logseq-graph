@@ -57,7 +57,9 @@ Logseq OG's implicit default, `MMM do, yyyy`. This treats the long common
 period before an explicit setting as a real journal-title format, so links such
 as `[[Jan 1st, 1970]]` can be found and migrated. Git history remains the
 source of truth for explicit values because inspecting only the working-tree
-setting would miss them.
+setting would miss them. The method uses local, read-only `git log` and `git
+show` commands because the graph's revision history is not exposed by a Swamp
+behavior; using only the current config would miss historical formats.
 
 ```sh
 swamp model method run my-graph journalFormats
@@ -98,8 +100,13 @@ does not impose a page category or classification. For example, `people`,
 classify the resulting page as a person.
 
 The method is dry-run by default because it rewrites Markdown and renames page
-files. It refuses target-page collisions instead of merging page content, since
-merging would require choosing how to resolve conflicting properties and blocks.
+files. By default, it refuses target-page collisions. Set
+`mergeExistingPages=true` to append the namespaced page's content to the
+existing target and bring over non-conflicting page properties. The existing
+target keeps its values when properties agree, and the configured property is
+set to the requested value. Conflicting values for another property stop the
+run before any files are written; this avoids silently choosing which page's
+metadata to discard.
 
 ```sh
 # Review the conversion first
@@ -111,6 +118,10 @@ swamp model method run my-graph convertNamespaceToPropertyBasedItems \
 swamp model method run my-graph convertNamespaceToPropertyBasedItems --input dryRun=false \
   --input namespace=contacts --input propertyKey=kind \
   --input propertyValue='[[Contact]]'
+
+# Merge a namespaced page when its target title already exists
+swamp model method run my-graph convertNamespaceToPropertyBasedItems \
+  --input '{"namespace":"company","propertyKey":"type","propertyValue":"Company","dryRun":false,"mergeExistingPages":true}'
 
 # Override a generated title when formatting alone cannot infer it
 swamp model method run my-graph convertNamespaceToPropertyBasedItems --input dryRun=false \

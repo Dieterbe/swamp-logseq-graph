@@ -193,6 +193,7 @@ function formatFromConfig(source: string): string | null {
 }
 
 async function git(graphPath: string, args: string[]): Promise<string> {
+  // swamp-quality-ignore deno-command
   const result = await new Deno.Command("git", {
     args,
     cwd: graphPath,
@@ -230,6 +231,10 @@ export async function journalFormats(
       .trim().split(/\s+/).filter(Boolean);
   const formats = new Set<string>();
   for (const commit of commits) {
+    if (!/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(commit)) {
+      throw new Error(`git returned an invalid commit ID: ${commit}`);
+    }
+    // swamp-quality-ignore deno-command
     const result = await new Deno.Command("git", {
       args: ["show", `${commit}:logseq/config.edn`],
       cwd: graphPath,

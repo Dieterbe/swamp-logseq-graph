@@ -252,6 +252,7 @@ Deno.test("convertNamespaceToPropertyBasedItems previews and applies page, refer
         namespace: "inbox",
         propertyKey: "classification",
         propertyValue: "[[Imported Item]]",
+        mergeExistingPages: false,
         titleMappings,
       },
       context,
@@ -291,6 +292,7 @@ Deno.test("convertNamespaceToPropertyBasedItems previews and applies page, refer
         namespace: "inbox",
         propertyKey: "classification",
         propertyValue: "[[Imported Item]]",
+        mergeExistingPages: false,
         titleMappings,
       },
       context,
@@ -324,6 +326,7 @@ Deno.test("convertNamespaceToPropertyBasedItems accepts a namespace and property
       namespace: "contacts",
       propertyKey: "kind",
       propertyValue: "[[Contact]]",
+      mergeExistingPages: false,
       titleMappings: {},
     }, {
       globalArgs: { graphPath },
@@ -343,6 +346,84 @@ Deno.test("convertNamespaceToPropertyBasedItems accepts a namespace and property
           "kind:: [[Contact]]\n",
         ),
       "configured property should be written to the normalized page",
+    );
+  });
+});
+
+Deno.test("convertNamespaceToPropertyBasedItems merges compatible title collisions", async () => {
+  await withTempGraph({
+    "pages/company___Caligra.md": "kind:: company\n- Incoming note\n",
+    "pages/Caligra.md": "status:: active\n- Existing note\n",
+    "pages/Notes.md": "- [[company/Caligra]]\n",
+  }, async (graphPath) => {
+    const context = {
+      globalArgs: { graphPath },
+      logger: { info: () => undefined },
+      writeResource: (_specName: string, name: string) =>
+        Promise.resolve({ name }),
+    };
+    await model.methods.convertNamespaceToPropertyBasedItems.execute({
+      dryRun: false,
+      namespace: "company",
+      propertyKey: "type",
+      propertyValue: "Company",
+      mergeExistingPages: true,
+      titleMappings: {},
+    }, context);
+    const merged = await Deno.readTextFile(`${graphPath}/pages/Caligra.md`);
+    assert(
+      merged.includes("status:: active") && merged.includes("type:: Company"),
+      "merge should preserve existing properties and set the requested property",
+    );
+    assert(
+      merged.includes("- Existing note") && merged.includes("- Incoming note"),
+      "merge should preserve both page bodies",
+    );
+    assert(
+      !(await exists(`${graphPath}/pages/company___Caligra.md`)),
+      "merged source page should be removed",
+    );
+    assert(
+      (await Deno.readTextFile(`${graphPath}/pages/Notes.md`)).includes(
+        "[[Caligra]]",
+      ),
+      "references should target the merged page",
+    );
+  });
+});
+
+Deno.test("updatePagePropertyAndTag updates matching pages and creates tags property", async () => {
+  await withTempGraph({
+    "pages/VC.md": "type:: VC\n- Fund\n",
+    "pages/Other.md": "type:: Company\n- Other\n",
+  }, async (graphPath) => {
+    const context = {
+      globalArgs: { graphPath },
+      logger: { info: () => undefined },
+      writeResource: (_specName: string, name: string) =>
+        Promise.resolve({ name }),
+    };
+    await model.methods.updatePagePropertyAndTag.execute({
+      propertyKey: "type",
+      fromValue: "VC",
+      toValue: "[[Company]]",
+      tag: "#vc",
+      tagsProperty: "tags",
+    }, context);
+    const updated = await Deno.readTextFile(`${graphPath}/pages/VC.md`);
+    assert(
+      updated.includes("type:: [[Company]]"),
+      "matched property should be replaced",
+    );
+    assert(
+      updated.includes("tags:: #vc"),
+      "missing tags property should be created",
+    );
+    assert(
+      !(await Deno.readTextFile(`${graphPath}/pages/Other.md`)).includes(
+        "tags::",
+      ),
+      "non-matching pages should stay unchanged",
     );
   });
 });
